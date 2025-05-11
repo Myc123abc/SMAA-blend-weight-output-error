@@ -2,6 +2,8 @@
 
 #include "SMAA_frag.h"
 
+layout(binding = 0) uniform sampler2D original_image;
+
 void main()
 {
   // TODO: try output image format r8g8 and change this vec4 to vec2

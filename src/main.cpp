@@ -2,17 +2,16 @@
 #include <cstdint>
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
-
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_init.h>
-
 #include <vulkan/vulkan.h>
-
+#include <glm/glm.hpp>
 #include <vector>
 #include <print>
 #include <fstream>
 #include <string_view>
 #include <algorithm>
+#include <cassert>
 
 ////////////////////////////////////////////////////////////////////////////////
 //                              global vars
@@ -28,7 +27,6 @@ VkPhysicalDevice         g_physical_device;
 VkQueue                  g_queue;
 uint32_t                 g_queue_family_index;
 VkDevice                 g_device;
-VmaAllocator             g_allocator;
 VkSwapchainKHR           g_swapchain;
 VkFormat                 g_swapchain_image_format;
 uint32_t                 g_swapchain_image_count;
@@ -39,6 +37,7 @@ std::vector<VkPipeline>  g_pipelines(4);  // 0 : triangle, 1 : edge detection, 2
 VkPipelineLayout         g_pipeline_layout_triangle;
 VkPipelineLayout         g_pipeline_layout_SMAA;  // all SMAA pass use common pipeline layout
 VkCommandPool            g_command_pool;
+VmaAllocator             g_allocator;
 
 struct Frame
 {
@@ -49,6 +48,42 @@ struct Frame
 };
 
 std::vector<Frame> g_frames;
+uint32_t           g_frame_index = 0;
+
+struct PushConstant
+{
+  glm::vec4 smaa_rt_metrics;
+};
+
+struct Image
+{
+  VkImage       handle;
+  VkImageView   view;
+  VmaAllocation allocation;
+  VkFormat      format;
+  VkExtent3D    extent;
+};
+
+
+//
+// SMAA resources
+//
+
+// every pass output image
+Image g_source_image;  // original image
+Image g_edges_image;  // edge detection
+Image g_blend_image;  // weight blend
+Image g_output_image; // neighbor
+
+VkSampler g_sampler;  // linear sampler
+
+VkDescriptorPool      g_descriptor_pool;
+VkDescriptorSetLayout g_descriptor_set_layout;
+VkDescriptorSet       g_descriptor_set;
+
+// use for blend weight pass
+Image g_area_texture;
+Image g_search_texture;
 
 ////////////////////////////////////////////////////////////////////////////////
 //                              misc funcs
@@ -64,9 +99,31 @@ inline void check_vk(VkResult result)
   exit_if(result != VK_SUCCESS);
 }
 
+auto destroy(Image& image)
+{
+  assert(image.handle && image.allocation && image.view);
+  vkDestroyImageView(g_device, image.view, nullptr);
+  vmaDestroyImage(g_allocator, image.handle, image.allocation);
+  image = {};
+}
+
 void release_resources()
 {
   vkDeviceWaitIdle(g_device);
+  
+  // SMAA resources
+  vkDestroyDescriptorSetLayout(g_device, g_descriptor_set_layout, nullptr);
+  vkDestroyDescriptorPool(g_device, g_descriptor_pool, nullptr);
+  destroy(g_source_image);
+  destroy(g_edges_image);
+  destroy(g_blend_image);
+  destroy(g_output_image);
+  destroy(g_area_texture);
+  destroy(g_search_texture);
+  vkDestroySampler(g_device, g_sampler, nullptr);
+  vmaDestroyAllocator(g_allocator);
+
+  // other resources
   for (auto& frame : g_frames)
   {
     vkDestroySemaphore(g_device, frame.image_available, nullptr);
@@ -82,7 +139,6 @@ void release_resources()
   for (auto image_view : g_swapchain_image_views)
     vkDestroyImageView(g_device, image_view, nullptr);
   vkDestroySwapchainKHR(g_device, g_swapchain, nullptr);
-  vmaDestroyAllocator(g_allocator);
   vkDestroyDevice(g_device, nullptr);
   vkDestroySurfaceKHR(g_instance, g_surface, nullptr);
   vkDestroyDebugUtilsMessengerEXT(g_instance, g_debug_messenger, nullptr);
@@ -184,6 +240,181 @@ void transform_image_layout(VkCommandBuffer cmd, VkImage image, VkImageLayout ol
   vkCmdPipelineBarrier(cmd, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, nullptr, 0, nullptr, 1, &barrier);
 }
 
+auto create_image(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage)
+{
+  Image image
+  {
+    .format = format,
+    .extent = { extent.width, extent.height, 1 },
+  };
+
+  VkImageCreateInfo image_info
+  {
+    .sType       = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO,
+    .imageType   = VK_IMAGE_TYPE_2D,
+    .format      = image.format,
+    .extent      = image.extent,
+    .mipLevels   = 1,
+    .arrayLayers = 1,
+    .samples     = VK_SAMPLE_COUNT_1_BIT,
+    .tiling      = VK_IMAGE_TILING_OPTIMAL,
+    .usage       = usage,
+  };
+
+  VmaAllocationCreateInfo alloc_info
+  {
+    .flags         = VMA_ALLOCATION_CREATE_DEDICATED_MEMORY_BIT,
+    .usage         = VMA_MEMORY_USAGE_AUTO,
+  };
+  check_vk(vmaCreateImage(g_allocator, &image_info, &alloc_info, &image.handle, &image.allocation, nullptr));
+
+  VkImageViewCreateInfo image_view_info
+  {
+    .sType    = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO,
+    .image    = image.handle,
+    .viewType = VK_IMAGE_VIEW_TYPE_2D,
+    .format   = image.format,
+    .subresourceRange =
+    {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .levelCount = 1,
+      .layerCount = 1,
+    },
+  };
+  check_vk(vkCreateImageView(g_device, &image_view_info, nullptr, &image.view));
+
+  return image;
+}
+
+void image_clear(VkCommandBuffer cmd, VkImage image)
+{
+  VkImageSubresourceRange range
+  {
+    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+    .levelCount = VK_REMAINING_MIP_LEVELS,
+    .layerCount = VK_REMAINING_ARRAY_LAYERS,
+  };
+  VkClearColorValue value{};
+  transform_image_layout(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
+  vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
+}
+
+////////////////////////////////////////////////////////////////////////////////
+//                              SMAA funs
+////////////////////////////////////////////////////////////////////////////////
+
+void create_SMAA_images()
+{
+  g_source_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
+  g_edges_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+  g_blend_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
+  g_output_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  g_area_texture = create_image(VK_FORMAT_R8G8B8A8_UNORM, { 512, 512 },   VK_IMAGE_USAGE_SAMPLED_BIT);
+  g_search_texture = create_image(VK_FORMAT_R8G8B8A8_UNORM, { 512, 512 }, VK_IMAGE_USAGE_SAMPLED_BIT);
+}
+
+void create_sampler()
+{
+  VkSamplerCreateInfo sampler_info
+  {
+    .sType        = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO,
+    .magFilter    = VK_FILTER_LINEAR,
+    .minFilter    = VK_FILTER_LINEAR,
+    .mipmapMode   = VK_SAMPLER_MIPMAP_MODE_LINEAR,
+    .addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    .addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+    .addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE,
+  };
+  check_vk(vkCreateSampler(g_device, &sampler_info, nullptr, &g_sampler));
+}
+
+void create_descriptor_resource()
+{
+  // create descriptor pool
+  VkDescriptorPoolSize pool_size
+  {
+    .type            = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+    .descriptorCount = 5,
+  };
+  VkDescriptorPoolCreateInfo pool_info
+  {
+    .sType         = VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO,
+    .maxSets       = 1,
+    .poolSizeCount = 1,
+    .pPoolSizes    = &pool_size,
+  };
+  check_vk(vkCreateDescriptorPool(g_device, &pool_info, nullptr, &g_descriptor_pool));
+
+  // create descriptor set layout
+  VkDescriptorSetLayoutBinding bindings[5]
+  {
+    { .binding = 0, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    { .binding = 1, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    { .binding = 2, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    { .binding = 3, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+    { .binding = 4, .descriptorType = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER, .descriptorCount = 1, .stageFlags = VK_SHADER_STAGE_FRAGMENT_BIT },
+  };
+  VkDescriptorSetLayoutCreateInfo layout_info
+  {
+    .sType        = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO,
+    .bindingCount = 5,
+    .pBindings    = bindings,
+  };
+  check_vk(vkCreateDescriptorSetLayout(g_device, &layout_info, nullptr, &g_descriptor_set_layout));
+
+  // allocate descriptor set
+  VkDescriptorSetAllocateInfo alloc_info
+  {
+    .sType              = VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO,
+    .descriptorPool     = g_descriptor_pool,
+    .descriptorSetCount = 1,
+    .pSetLayouts        = &g_descriptor_set_layout,
+  };
+  check_vk(vkAllocateDescriptorSets(g_device, &alloc_info, &g_descriptor_set));
+
+  // update descriptor set
+  std::vector<VkDescriptorImageInfo> image_infos
+  {
+    { .sampler = g_sampler, .imageView = g_source_image.view,   .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    { .sampler = g_sampler, .imageView = g_edges_image.view,    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    { .sampler = g_sampler, .imageView = g_blend_image.view,    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    { .sampler = g_sampler, .imageView = g_area_texture.view,   .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    { .sampler = g_sampler, .imageView = g_search_texture.view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+  };
+  std::vector<VkWriteDescriptorSet> write_infos(5);
+  for (size_t i = 0; i < image_infos.size(); ++i)
+  {
+    write_infos[i] = 
+    {
+      .sType           = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET,
+      .dstSet          = g_descriptor_set,
+      .dstBinding      = static_cast<uint32_t>(i),
+      .descriptorCount = 1,
+      .descriptorType  = VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER,
+      .pImageInfo      = &image_infos[i],
+    };
+  }
+  vkUpdateDescriptorSets(g_device, static_cast<uint32_t>(write_infos.size()), write_infos.data(), 0, nullptr);
+}
+
+void create_SMAA_pipeline_layout()
+{
+  VkPushConstantRange push_constant_range
+  {
+    .stageFlags = VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+    .size       = sizeof(PushConstant),
+  };
+  VkPipelineLayoutCreateInfo layout_info
+  {
+    .sType                  = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
+    .setLayoutCount         = 1,
+    .pSetLayouts            = &g_descriptor_set_layout,
+    .pushConstantRangeCount = 1,
+    .pPushConstantRanges    = &push_constant_range,
+  };
+  check_vk(vkCreatePipelineLayout(g_device, &layout_info, nullptr, &g_pipeline_layout_SMAA));
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 //                              init funcs
 ////////////////////////////////////////////////////////////////////////////////
@@ -282,7 +513,6 @@ void create_device_and_get_graphics_queue()
   VkPhysicalDeviceVulkan13Features features13
   { 
     .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
-    .pNext               = nullptr, 
     .synchronization2    = true,
     .dynamicRendering    = true,
   };
@@ -382,17 +612,13 @@ void create_swapchain()
   g_swapchain_extent = surface_capabilities.currentExtent;
 }
 
-void create_pipeline_layout()
+void create_triangle_pipeline_layout()
 {
-  // create triangle pipeline layout
   VkPipelineLayoutCreateInfo layout_info
   {
     .sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO,
   };
   check_vk(vkCreatePipelineLayout(g_device, &layout_info, nullptr, &g_pipeline_layout_triangle));
-
-  // create SMAA pipeline layout
-  check_vk(vkCreatePipelineLayout(g_device, &layout_info, nullptr, &g_pipeline_layout_SMAA));
 }
 
 auto create_pipeline(VkPipelineLayout pipeline_layout, std::string_view vertex_shader, std::string_view fragment_shader) -> VkPipeline
@@ -553,26 +779,69 @@ void init_vk()
   create_surface();
   select_physical_device();
   create_device_and_get_graphics_queue();
-  init_vma();
   create_swapchain();
-  create_pipeline_layout();
-  g_pipelines[0] = create_pipeline(g_pipeline_layout_triangle, "triangle_vert.spv",            "triangle_frag.spv");
-  //g_pipelines[1] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_edge_detection_vert.spv", "SMAA_edge_detection_frag.spv");
-  //g_pipelines[2] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_blend_weight_vert.spv",   "SMAA_blend_weight_frag.spv");
-  //g_pipelines[3] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_neighbor_vert.spv",       "SMAA_neighbor_frag.spv");
+  create_triangle_pipeline_layout();
+  g_pipelines[0] = create_pipeline(g_pipeline_layout_triangle, "triangle_vert.spv", "triangle_frag.spv");
   create_command_pool();
   init_frames();
+
+  init_vma();
+  create_SMAA_images();
+  create_sampler();
+  create_descriptor_resource();
+  create_SMAA_pipeline_layout();
+  g_pipelines[1] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_edge_detection_vert.spv", "SMAA_edge_detection_frag.spv");
+  //g_pipelines[2] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_blend_weight_vert.spv",   "SMAA_blend_weight_frag.spv");
+  //g_pipelines[3] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_neighbor_vert.spv",       "SMAA_neighbor_frag.spv");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
 //                              render funcs
 ////////////////////////////////////////////////////////////////////////////////
 
+void post_processing()
+{
+  auto frame = g_frames[g_frame_index];
+
+  // upload push constant and descriptor set
+  PushConstant pc
+  {
+    .smaa_rt_metrics = glm::vec4(1.f / g_swapchain_extent.width, 1.f / g_swapchain_extent.height, g_swapchain_extent.width, g_swapchain_extent.height),
+  };
+  vkCmdPushConstants(frame.cmd, g_pipeline_layout_SMAA, VK_SHADER_STAGE_VERTEX_BIT | VK_SHADER_STAGE_FRAGMENT_BIT, 0, sizeof(pc), &pc);
+  vkCmdBindDescriptorSets(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipeline_layout_SMAA, 0, 1, &g_descriptor_set, 0, nullptr);
+
+  // edge detection
+  transform_image_layout(frame.cmd, g_edges_image.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  transform_image_layout(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  //image_clear(frame.cmd, g_edges_image.handle);
+  VkRenderingAttachmentInfo color_attachment
+  {
+    .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
+    .imageView   = g_edges_image.view,
+    .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+    .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
+    .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+    .clearValue  = { .color = { 0.f, 0.f, 0.f, 0.f } },
+  };
+  VkRenderingInfo rendering
+  {
+    .sType                = VK_STRUCTURE_TYPE_RENDERING_INFO,
+    .renderArea           = { {}, g_swapchain_extent },
+    .layerCount           = 1,
+    .colorAttachmentCount = 1,
+    .pColorAttachments    = &color_attachment,
+  };
+  vkCmdBeginRendering(frame.cmd, &rendering);
+  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[1]);
+  vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(frame.cmd);
+}
+
 void render()
 {
   // get current frame
-  static int frame_index = 0;
-  auto frame = g_frames[frame_index];
+  auto frame = g_frames[g_frame_index];
 
   // wait for previous frame
   check_vk(vkWaitForFences(g_device, 1, &frame.fence, VK_TRUE, UINT64_MAX));
@@ -591,15 +860,27 @@ void render()
   };
   vkBeginCommandBuffer(frame.cmd, &beg_info);
 
+  // viewport and scissor
+  VkViewport viewport
+  {
+    .width    = static_cast<float>(g_swapchain_extent.width),
+    .height   = static_cast<float>(g_swapchain_extent.height),
+    .maxDepth = 1.f
+  };
+  vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
+  VkRect2D scissor{ {}, g_swapchain_extent };
+  vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
+
   // render color attachment
-  transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  transform_image_layout(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
   VkRenderingAttachmentInfo color_attachment
   {
     .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
-    .imageView   = g_swapchain_image_views[image_index],
+    .imageView   = g_source_image.view,
     .imageLayout = VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
-    .loadOp      = VK_ATTACHMENT_LOAD_OP_DONT_CARE,
+    .loadOp      = VK_ATTACHMENT_LOAD_OP_CLEAR,
     .storeOp     = VK_ATTACHMENT_STORE_OP_STORE,
+    .clearValue  = { .color = { 0.f, 0.f, 0.f, 1.f } },
   };
 
   // begin rendering
@@ -613,17 +894,6 @@ void render()
   };
   vkCmdBeginRendering(frame.cmd, &rendering);
 
-  // viewport and scissor
-  VkViewport viewport
-  {
-    .width    = static_cast<float>(g_swapchain_extent.width),
-    .height   = static_cast<float>(g_swapchain_extent.height),
-    .maxDepth = 1.f
-  };
-  vkCmdSetViewport(frame.cmd, 0, 1, &viewport);
-  VkRect2D scissor{ {}, g_swapchain_extent };
-  vkCmdSetScissor(frame.cmd, 0, 1, &scissor);
-
   // bind pipeline
   vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[0]);
 
@@ -633,8 +903,22 @@ void render()
   // end rendering
   vkCmdEndRendering(frame.cmd);
 
+  // post processing
+  post_processing();
+
+  // copy rendered image to swapchain image
+  transform_image_layout(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  VkImageCopy copy_region
+  {
+    .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+    .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
+    .extent        = { g_swapchain_extent.width, g_swapchain_extent.height, 1 },
+  };
+  vkCmdCopyImage(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+
   // transform sawpchain image to present layout
-  transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
+  transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
 
   // end command buffer
   vkEndCommandBuffer(frame.cmd);
@@ -681,7 +965,7 @@ void render()
   check_vk(vkQueuePresentKHR(g_queue, &present_info)); 
 
   // next frame
-  frame_index = (frame_index + 1) % g_swapchain_image_count;
+  g_frame_index = (g_frame_index + 1) % g_swapchain_image_count;
 }
 
 ////////////////////////////////////////////////////////////////////////////////
