@@ -305,19 +305,6 @@ auto create_image(VkFormat format, VkExtent2D extent, VkImageUsageFlags usage)
   return image;
 }
 
-void image_clear(VkCommandBuffer cmd, VkImage image)
-{
-  VkImageSubresourceRange range
-  {
-    .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
-    .levelCount = VK_REMAINING_MIP_LEVELS,
-    .layerCount = VK_REMAINING_ARRAY_LAYERS,
-  };
-  VkClearColorValue value{};
-  transform_image_layout(cmd, image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL);
-  vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
-}
-
 auto create_buffer(uint32_t size, VkBufferUsageFlags usages, VmaAllocationCreateFlags flags)
 {
   Buffer buffer;
@@ -347,7 +334,7 @@ void create_SMAA_images()
   g_source_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
   g_edges_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   g_blend_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
-  g_output_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
+  g_output_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT);
 }
 
 void create_sampler()
@@ -717,8 +704,7 @@ void create_swapchain()
     .imageColorSpace  = surface_formats[0].colorSpace,
     .imageExtent      = surface_capabilities.currentExtent,
     .imageArrayLayers = 1,
-    .imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
-                        VK_IMAGE_USAGE_TRANSFER_DST_BIT,
+    .imageUsage       = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT,
     .preTransform     = surface_capabilities.currentTransform,
     .compositeAlpha   = VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
     .presentMode      = VK_PRESENT_MODE_FIFO_KHR,
@@ -936,7 +922,7 @@ void init_vk()
   create_SMAA_pipeline_layout();
   g_pipelines[1] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_edge_detection_vert.spv", "SMAA_edge_detection_frag.spv");
   g_pipelines[2] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_blend_weight_vert.spv",   "SMAA_blend_weight_frag.spv");
-  //g_pipelines[3] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_neighbor_vert.spv",       "SMAA_neighbor_frag.spv");
+  g_pipelines[3] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_neighbor_vert.spv",       "SMAA_neighbor_frag.spv");
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -958,7 +944,6 @@ void post_processing()
   // edge detection
   transform_image_layout(frame.cmd, g_edges_image.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
   transform_image_layout(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
-  //image_clear(frame.cmd, g_edges_image.handle);
   VkRenderingAttachmentInfo color_attachment
   {
     .sType       = VK_STRUCTURE_TYPE_RENDERING_ATTACHMENT_INFO,
@@ -987,6 +972,15 @@ void post_processing()
   color_attachment.imageView = g_blend_image.view;
   vkCmdBeginRendering(frame.cmd, &rendering);
   vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[2]);
+  vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(frame.cmd);
+
+  // neighbor
+  transform_image_layout(frame.cmd, g_output_image.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  transform_image_layout(frame.cmd, g_blend_image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  color_attachment.imageView = g_output_image.view;
+  vkCmdBeginRendering(frame.cmd, &rendering);
+  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[3]);
   vkCmdDraw(frame.cmd, 3, 1, 0, 0);
   vkCmdEndRendering(frame.cmd);
 }
@@ -1060,15 +1054,15 @@ void render()
   post_processing();
 
   // copy rendered image to swapchain image
-  transform_image_layout(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
+  transform_image_layout(frame.cmd, g_output_image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
   transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
   VkImageCopy copy_region
   {
     .srcSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
     .dstSubresource = { VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1 },
-    .extent        = { g_swapchain_extent.width, g_swapchain_extent.height, 1 },
+    .extent         = { g_swapchain_extent.width, g_swapchain_extent.height, 1 },
   };
-  vkCmdCopyImage(frame.cmd, g_source_image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
+  vkCmdCopyImage(frame.cmd, g_output_image.handle, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copy_region);
 
   // transform sawpchain image to present layout
   transform_image_layout(frame.cmd, g_swapchain_images[image_index], VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_PRESENT_SRC_KHR);
