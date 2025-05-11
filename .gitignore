@@ -1,0 +1,4 @@
+build
+.cache
+shader/SMAA.hlsl
+.vscode
