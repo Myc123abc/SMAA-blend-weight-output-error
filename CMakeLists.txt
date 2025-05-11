@@ -34,29 +34,17 @@ FetchContent_MakeAvailable(SMAA)
 
 find_package(Vulkan REQUIRED)
 
-# includes, sources, links
-set(INCLUDE
-  include
-)
-
-file(GLOB_RECURSE SOURCE src/*.cpp)
-
-set(LIBS
-  SDL3::SDL3-static
-  GPUOpen::VulkanMemoryAllocator
-)
-
 # compile executable
-add_executable(SMAA_test ${SOURCE})
+add_executable(SMAA_test main.cpp)
 
 target_include_directories(SMAA_test PUBLIC
-  ${INCLUDE}
   ${Vulkan_INCLUDE_DIRS}
   ${smaa_SOURCE_DIR}/Textures
 )
 
 target_link_libraries(SMAA_test PUBLIC
-  ${LIBS}
+  SDL3::SDL3-static
+  GPUOpen::VulkanMemoryAllocator
   ${Vulkan_LIBRARIES}
 )
 
