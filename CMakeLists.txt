@@ -52,6 +52,7 @@ add_executable(SMAA_test ${SOURCE})
 target_include_directories(SMAA_test PUBLIC
   ${INCLUDE}
   ${Vulkan_INCLUDE_DIRS}
+  ${smaa_SOURCE_DIR}/Textures
 )
 
 target_link_libraries(SMAA_test PUBLIC

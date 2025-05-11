@@ -1,11 +1,17 @@
 #include "vulkan/vulkan_core.h"
-#include <cstdint>
 #define VMA_IMPLEMENTATION
 #include <vk_mem_alloc.h>
+
 #include <SDL3/SDL_vulkan.h>
 #include <SDL3/SDL_init.h>
+
 #include <vulkan/vulkan.h>
+
 #include <glm/glm.hpp>
+
+#include "AreaTex.h"
+#include "SearchTex.h"
+
 #include <vector>
 #include <print>
 #include <fstream>
@@ -64,6 +70,12 @@ struct Image
   VkExtent3D    extent;
 };
 
+struct Buffer
+{
+  VkBuffer      handle;
+  VmaAllocation allocation;
+};
+
 
 //
 // SMAA resources
@@ -105,6 +117,13 @@ auto destroy(Image& image)
   vkDestroyImageView(g_device, image.view, nullptr);
   vmaDestroyImage(g_allocator, image.handle, image.allocation);
   image = {};
+}
+
+auto destroy(Buffer& buffer)
+{
+  assert(buffer.handle && buffer.allocation);
+  vmaDestroyBuffer(g_allocator, buffer.handle, buffer.allocation);
+  buffer = {};
 }
 
 void release_resources()
@@ -299,6 +318,26 @@ void image_clear(VkCommandBuffer cmd, VkImage image)
   vkCmdClearColorImage(cmd, image, VK_IMAGE_LAYOUT_GENERAL, &value, 1, &range);
 }
 
+auto create_buffer(uint32_t size, VkBufferUsageFlags usages, VmaAllocationCreateFlags flags)
+{
+  Buffer buffer;
+
+  VkBufferCreateInfo buf_info
+  {
+    .sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+    .size  = size,
+    .usage = usages,
+  };
+  VmaAllocationCreateInfo alloc_info
+  {
+    .flags = flags,
+    .usage = VMA_MEMORY_USAGE_AUTO,
+  };
+  check_vk(vmaCreateBuffer(g_allocator, &buf_info, &alloc_info, &buffer.handle, &buffer.allocation, nullptr));
+
+  return buffer;
+}
+
 ////////////////////////////////////////////////////////////////////////////////
 //                              SMAA funs
 ////////////////////////////////////////////////////////////////////////////////
@@ -309,8 +348,6 @@ void create_SMAA_images()
   g_edges_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   g_blend_image  = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT);
   g_output_image = create_image(g_swapchain_image_format, g_swapchain_extent, VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT);
-  g_area_texture = create_image(VK_FORMAT_R8G8B8A8_UNORM, { 512, 512 },   VK_IMAGE_USAGE_SAMPLED_BIT);
-  g_search_texture = create_image(VK_FORMAT_R8G8B8A8_UNORM, { 512, 512 }, VK_IMAGE_USAGE_SAMPLED_BIT);
 }
 
 void create_sampler()
@@ -377,9 +414,9 @@ void create_descriptor_resource()
   {
     { .sampler = g_sampler, .imageView = g_source_image.view,   .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     { .sampler = g_sampler, .imageView = g_edges_image.view,    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
-    { .sampler = g_sampler, .imageView = g_blend_image.view,    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     { .sampler = g_sampler, .imageView = g_area_texture.view,   .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
     { .sampler = g_sampler, .imageView = g_search_texture.view, .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
+    { .sampler = g_sampler, .imageView = g_blend_image.view,    .imageLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL },
   };
   std::vector<VkWriteDescriptorSet> write_infos(5);
   for (size_t i = 0; i < image_infos.size(); ++i)
@@ -413,6 +450,103 @@ void create_SMAA_pipeline_layout()
     .pPushConstantRanges    = &push_constant_range,
   };
   check_vk(vkCreatePipelineLayout(g_device, &layout_info, nullptr, &g_pipeline_layout_SMAA));
+}
+
+void load_textures()
+{
+  // create texture images
+  g_area_texture   = create_image(VK_FORMAT_R8G8_UNORM, { AREATEX_WIDTH, AREATEX_HEIGHT },     VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+  g_search_texture = create_image(VK_FORMAT_R8_UNORM,   { SEARCHTEX_WIDTH, SEARCHTEX_HEIGHT }, VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT);
+
+  // create stage buffer
+  auto stage_buffer = create_buffer(AREATEX_SIZE + SEARCHTEX_SIZE, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, VMA_ALLOCATION_CREATE_HOST_ACCESS_SEQUENTIAL_WRITE_BIT);
+
+  // copy texture data to stage buffer
+  check_vk(vmaCopyMemoryToAllocation(g_allocator, areaTexBytes, stage_buffer.allocation, 0, AREATEX_SIZE));
+  check_vk(vmaCopyMemoryToAllocation(g_allocator, searchTexBytes, stage_buffer.allocation, AREATEX_SIZE, SEARCHTEX_SIZE));
+
+  // create command buffer to record
+  VkCommandBuffer cmd;
+  VkCommandBufferAllocateInfo cmd_info
+  {
+    .sType              = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO,
+    .commandPool        = g_command_pool,
+    .level              = VK_COMMAND_BUFFER_LEVEL_PRIMARY,
+    .commandBufferCount = 1,
+  };
+  check_vk(vkAllocateCommandBuffers(g_device, &cmd_info, &cmd));
+
+  // begin command buffer
+  VkCommandBufferBeginInfo beg_info
+  {
+    .sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
+    .flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT ,
+  };
+  vkBeginCommandBuffer(cmd, &beg_info);
+
+  // transform image layout for copy
+  transform_image_layout(cmd, g_area_texture.handle,   VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+  transform_image_layout(cmd, g_search_texture.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+
+  // copy buffer to area texture
+  VkBufferImageCopy2 region
+  {
+    .sType            = VK_STRUCTURE_TYPE_BUFFER_IMAGE_COPY_2,
+    .bufferOffset     = 0,
+    .imageSubresource =
+    {
+      .aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+      .layerCount = 1,
+    },
+    .imageExtent = 
+    {
+      .width  = AREATEX_WIDTH,
+      .height = AREATEX_HEIGHT,
+      .depth  = 1,
+    },
+  };
+  VkCopyBufferToImageInfo2 copy_info
+  {
+    .sType          = VK_STRUCTURE_TYPE_COPY_BUFFER_TO_IMAGE_INFO_2,
+    .srcBuffer      = stage_buffer.handle,
+    .dstImage       = g_area_texture.handle,
+    .dstImageLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
+    .regionCount    = 1,
+    .pRegions       = &region,
+  };
+  vkCmdCopyBufferToImage2(cmd, &copy_info);
+
+  // copy buffer to search texture
+  region.bufferOffset       = AREATEX_SIZE;
+  region.imageExtent.width  = SEARCHTEX_WIDTH;
+  region.imageExtent.height = SEARCHTEX_HEIGHT;
+  copy_info.dstImage        = g_search_texture.handle;
+  vkCmdCopyBufferToImage2(cmd, &copy_info);
+
+  // transform image layout for shader read
+  transform_image_layout(cmd, g_area_texture.handle,   VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  transform_image_layout(cmd, g_search_texture.handle, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+
+  // end command buffer
+  check_vk(vkEndCommandBuffer(cmd));
+
+  // submit command buffer
+  VkSubmitInfo submit_info
+  {
+    .sType                = VK_STRUCTURE_TYPE_SUBMIT_INFO,
+    .commandBufferCount   = 1,
+    .pCommandBuffers      = &cmd,
+  };
+  check_vk(vkQueueSubmit(g_queue, 1, &submit_info, VK_NULL_HANDLE));
+
+  // wait for queue to finish
+  check_vk(vkQueueWaitIdle(g_queue));
+
+  // free command buffer
+  vkFreeCommandBuffers(g_device, g_command_pool, 1, &cmd);
+
+  // destroy stage buffer
+  destroy(stage_buffer);
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -513,13 +647,20 @@ void create_device_and_get_graphics_queue()
   VkPhysicalDeviceVulkan13Features features13
   { 
     .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_3_FEATURES,
+    .pNext               = nullptr, 
     .synchronization2    = true,
     .dynamicRendering    = true,
+  };
+  VkPhysicalDeviceVulkan12Features features12
+  { 
+    .sType               = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_VULKAN_1_2_FEATURES,
+    .pNext               = &features13,
+    .bufferDeviceAddress = true,
   };
   VkPhysicalDeviceFeatures2 features2
   {
     .sType    = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2,
-    .pNext    = &features13,
+    .pNext    = &features12,
   };
 
   // create device
@@ -774,6 +915,7 @@ void init_frames()
 
 void init_vk()
 {
+  // vulkan init
   create_instance();
   create_debug_messenger();
   create_surface();
@@ -785,13 +927,15 @@ void init_vk()
   create_command_pool();
   init_frames();
 
+  // SMAA init
   init_vma();
   create_SMAA_images();
+  load_textures();
   create_sampler();
   create_descriptor_resource();
   create_SMAA_pipeline_layout();
   g_pipelines[1] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_edge_detection_vert.spv", "SMAA_edge_detection_frag.spv");
-  //g_pipelines[2] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_blend_weight_vert.spv",   "SMAA_blend_weight_frag.spv");
+  g_pipelines[2] = create_pipeline(g_pipeline_layout_SMAA, "SMAA_blend_weight_vert.spv",   "SMAA_blend_weight_frag.spv");
   //g_pipelines[3] = create_pipeline(g_pipeline_layout_SMAA,     "SMAA_neighbor_vert.spv",       "SMAA_neighbor_frag.spv");
 }
 
@@ -834,6 +978,15 @@ void post_processing()
   };
   vkCmdBeginRendering(frame.cmd, &rendering);
   vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[1]);
+  vkCmdDraw(frame.cmd, 3, 1, 0, 0);
+  vkCmdEndRendering(frame.cmd);
+
+  // blend weight
+  transform_image_layout(frame.cmd, g_blend_image.handle, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL);
+  transform_image_layout(frame.cmd, g_edges_image.handle, VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL, VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL);
+  color_attachment.imageView = g_blend_image.view;
+  vkCmdBeginRendering(frame.cmd, &rendering);
+  vkCmdBindPipeline(frame.cmd, VK_PIPELINE_BIND_POINT_GRAPHICS, g_pipelines[2]);
   vkCmdDraw(frame.cmd, 3, 1, 0, 0);
   vkCmdEndRendering(frame.cmd);
 }
